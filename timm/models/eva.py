@@ -1310,3 +1310,23 @@ def vit_base_patch16_rope_reg1_gap_256(pretrained=False, **kwargs) -> Eva:
     )
     model = _create_eva('vit_base_patch16_rope_reg1_gap_256', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
+
+@register_model
+def vit_small_patch16_rope_gap_224(pretrained=False, **kwargs) -> Eva:
+    model_args = dict(
+        img_size=224,
+        patch_size=16,
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        qkv_fused=True,
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=False,
+        num_reg_tokens=0,
+        use_rot_pos_emb=True,
+        use_abs_pos_emb=False,
+        ref_feat_shape=(16, 16),  # 224/14
+    )
+    model = _create_eva('vit_small_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model

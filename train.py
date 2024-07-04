@@ -22,7 +22,7 @@ import os
 import time
 from collections import OrderedDict
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import partial
 
 import torch
@@ -121,6 +121,7 @@ group.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH',
                    help='Load this checkpoint into model after initialization (default: none)')
 group.add_argument('--resume', default='', type=str, metavar='PATH',
                    help='Resume full model and optimizer state from checkpoint (default: none)')
+group.add_argument('--auto-resume', action='store_true', default=False, help='Attempt to auto resume from checkpoint')
 group.add_argument('--no-resume-opt', action='store_true', default=False,
                    help='prevent resume of optimizer state when resuming model')
 group.add_argument('--num-classes', type=int, default=None, metavar='N',
@@ -381,6 +382,8 @@ group.add_argument('--output', default='', type=str, metavar='PATH',
                    help='path to output folder (default: none, current dir)')
 group.add_argument('--experiment', default='', type=str, metavar='NAME',
                    help='name of train experiment, name of sub-folder for output')
+group.add_argument('--tag', default='', type=str, metavar='TAG',
+                   help='tag of train experiment, name of sub-folder for output')
 group.add_argument('--eval-metric', default='top1', type=str, metavar='EVAL_METRIC',
                    help='Best metric (default: "top1"')
 group.add_argument('--tta', type=int, default=0, metavar='N',
@@ -409,7 +412,6 @@ def _parse_args():
 
 
 def main():
-    utils.setup_default_logging()
     args, args_text = _parse_args()
 
     if args.device_modules:
@@ -423,6 +425,38 @@ def main():
     args.prefetcher = not args.no_prefetcher
     args.grad_accum_steps = max(1, args.grad_accum_steps)
     device = utils.init_distributed_device(args)
+
+    output_dir = None
+    log_file = ''
+
+    data_config = resolve_data_config(vars(args), verbose=utils.is_primary(args))
+    global_batch_size = args.batch_size * args.world_size * args.grad_accum_steps
+    if args.experiment:
+        exp_name = args.experiment
+    else:
+        if args.tag:
+            exp_name = '-'.join([
+                safe_model_name(args.model),
+                str(data_config['input_size'][-1]),
+                f"bs{global_batch_size}x{args.world_size}",
+            ])
+        else:
+            assert not args.auto_resume
+            exp_name = '-'.join([
+                datetime.now().strftime("%Y%m%d-%H%M%S"),
+                safe_model_name(args.model),
+                str(data_config['input_size'][-1]),
+                f"bs{global_batch_size}x{args.world_size}",
+            ])
+        
+    if utils.is_primary(args):
+        if args.tag:
+            output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name, args.tag)
+        else:
+            output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
+        log_file = os.path.join(output_dir, 'log.txt')
+    utils.setup_default_logging(log_path=log_file)
+
     if args.distributed:
         _logger.info(
             'Training in distributed mode with multiple processes, 1 device per process.'
@@ -430,6 +464,18 @@ def main():
     else:
         _logger.info(f'Training with a single process on 1 device ({args.device}).')
     assert args.rank >= 0
+
+    import sys
+    sys.path.append(os.environ.get('SUBMIT_SCRIPTS','.'))
+    try:
+        _logger.info("Importing AutoResume lib...")
+        from userlib.auto_resume import AutoResume
+
+        AutoResume.init()
+        _logger.info("Found AutoResume SDK!")
+    except:
+        _logger.info("Did not find AutResume SDK!")
+        AutoResume = None
 
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
@@ -584,6 +630,16 @@ def main():
     else:
         if utils.is_primary(args):
             _logger.info('AMP not enabled. Training in float32.')
+
+    if args.auto_resume:
+        assert args.tag
+        assert not args.resume
+        auto_resume_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name, args.tag)
+        resume_checkpoint_path = os.path.join(auto_resume_dir, 'last.pth.tar')
+        if os.path.isfile(resume_checkpoint_path):
+            if utils.is_primary(args):
+                _logger.info(f'Auto resuming from {resume_checkpoint_path}...')
+            args.resume = resume_checkpoint_path
 
     # optionally resume from a checkpoint
     resume_epoch = None
@@ -789,17 +845,7 @@ def main():
     best_metric = None
     best_epoch = None
     saver = None
-    output_dir = None
     if utils.is_primary(args):
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = utils.get_outdir(args.output if args.output else './output/train', exp_name)
         saver = utils.CheckpointSaver(
             model=model,
             optimizer=optimizer,
@@ -813,10 +859,25 @@ def main():
         )
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
+        
+
 
     if utils.is_primary(args) and args.log_wandb:
         if has_wandb:
-            wandb.init(project=args.experiment, config=args)
+            if args.tag:
+                wandb_exp_name = f"{exp_name}-{args.tag}"
+            else:
+                wandb_exp_name = exp_name
+            wandb_run = wandb.init(project='timm', name=wandb_exp_name, tags=[args.tag] if args.tag else None, config=args, resume=args.resume != '', dir=output_dir)
+            # manually write "wandb-resume.json" file
+            # it is automatically created by wandb.init() only resume=True
+            # so we manually create it when resume=False
+            # such that we could resume a run even if we passed resume=False previously
+            resume_file = os.path.join(output_dir, "wandb/wandb-resume.json")
+            if not args.resume:
+                _logger.warning("Manually create wandb-resume.json file")
+                with open(resume_file, "w") as f:
+                    json.dump({"run_id": wandb_run.id}, f)
         else:
             _logger.warning(
                 "You've requested to log metrics to wandb but package not found. "
@@ -848,6 +909,7 @@ def main():
     results = []
     try:
         for epoch in range(start_epoch, num_epochs):
+            epoch_start_time = time.time()
             if hasattr(dataset_train, 'set_epoch'):
                 dataset_train.set_epoch(epoch)
             elif args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
@@ -932,6 +994,28 @@ def main():
                 'train': train_metrics,
                 'validation': eval_metrics,
             })
+            epoch_end_time = time.time()
+
+            if utils.is_primary(args):
+                epoch_duration = epoch_end_time - epoch_start_time
+                remaining_epochs = num_epochs - epoch - 1
+                estimated_time_to_complete = remaining_epochs * epoch_duration
+                eta_formatted = str(timedelta(seconds=estimated_time_to_complete))
+                _logger.info(f"Epoch {epoch} completed in {str(timedelta(seconds=epoch_duration))}")
+                _logger.info(f"ETA: {eta_formatted}")
+            
+            # Check whether to suspend the job.
+            should_preempt = (
+                AutoResume is not None and AutoResume.termination_requested()
+            )
+
+            if should_preempt:
+                if utils.is_primary(args):
+                    _logger.info(f"AutoResumeHook: Request resume...")
+                    AutoResume.request_resume()
+
+                _logger.info(f"AutoResumeHook: Suspend the job...")
+                raise KeyboardInterrupt
 
     except KeyboardInterrupt:
         pass
@@ -941,6 +1025,15 @@ def main():
         results['best'] = results['all'][best_epoch - start_epoch]
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
     print(f'--result\n{json.dumps(results, indent=4)}')
+
+    # When we are done training, let autoresume know it should
+    # not make any more requeusts. This is required with --autoresume_method requeue
+    # though not with the default submit_job method.
+    if AutoResume is not None and utils.is_primary(args) and (epoch + 1) == num_epochs:
+        _logger.info("Reached target epoch: %d" % num_epochs)
+        AutoResume.stop_resuming()        
+        _logger.info("Training process for rank 0 is quitting")
+
 
 
 def train_one_epoch(

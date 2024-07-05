@@ -46,8 +46,19 @@ from ._registry import generate_default_cfgs, register_model
 __all__ = ['EvaTTT']
 
 
+class LayerNormFp32(LayerNorm):
+    """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
+
+    def forward(self, x: torch.Tensor):
+        orig_type = x.dtype
+        x = super().forward(x.to(torch.float32))
+        return x.to(orig_type)
+
+
 def ln_fwd(x, gamma, beta, eps=1e-6):
     "Batch forward for LayerNorm."
+    orig_type = x.dtype
+    x = x.to(torch.float32)
 
     # Mean and variance computation
     mu = x.mean(dim=-1, keepdim=True)
@@ -60,11 +71,14 @@ def ln_fwd(x, gamma, beta, eps=1e-6):
     # Scale and shift
     y = gamma * x_hat + beta
 
-    return y
+    return y.to(orig_type)
 
 
 def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
     "Batch backward for LayerNorm fused with L2 loss."
+    orig_type = x.dtype
+    x = x.to(torch.float32)
+
     D = x.shape[-1]
 
     # Mean and variance computation
@@ -90,7 +104,7 @@ def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
         / std
     )
 
-    return z
+    return z.to(orig_type)
 
 
 # Modified from https://github.com/NVIDIA/Megatron-LM/blob/e33c8f78a35765d5aa37475a144da60e8a2349d1/megatron/core/fusions/fused_bias_gelu.py#L26
@@ -208,6 +222,9 @@ class EvaBasePrimal(nn.Module):
         self.num_mini_batch = 1
         self.ttt_base_lr = ttt_base_lr
     
+    def extra_repr(self) -> str:
+        return f"num_mini_batch={self.num_mini_batch}, ttt_base_lr={self.ttt_base_lr}"
+
     def ttt(self, q, k, v, ttt_lr_eta):
         raise NotImplementedError
 
@@ -375,8 +392,6 @@ class EvaM2Primal(EvaBasePrimal):
         self.b1 = nn.Parameter(torch.zeros(self.num_heads, 1, 4 * self.head_dim))
         self.W2 = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, 4 * self.head_dim, self.head_dim)))
         self.b2 = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim))
-    
-        self.ttt_base_lr *= 0.1
 
     def ttt(self, q, k, v, ttt_lr_eta):
         """
@@ -616,6 +631,7 @@ class EvaBlock(nn.Module):
             norm_layer: Callable = LayerNorm,
             attn_head_dim: Optional[int] = None,
             inner_net: str = 'linear_attention',
+            ttt_base_lr: float = 1.0,
     ):
         """
 
@@ -661,6 +677,7 @@ class EvaBlock(nn.Module):
                 proj_drop=proj_drop,
                 attn_head_dim=attn_head_dim,
                 norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
             )
         elif inner_net == 'm2_primal':
             self.attn = EvaM2Primal(
@@ -673,6 +690,7 @@ class EvaBlock(nn.Module):
                 proj_drop=proj_drop,
                 attn_head_dim=attn_head_dim,
                 norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
             )
         else:
             raise ValueError(f"Unsupported inner_net: {inner_net}")
@@ -871,7 +889,7 @@ class EvaTTT(nn.Module):
             proj_drop_rate: float = 0.,
             attn_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
-            norm_layer: Callable = LayerNorm,
+            norm_layer: Callable = LayerNormFp32,
             init_values: Optional[float] = None,
             class_token: bool = True,
             num_reg_tokens: int = 0,
@@ -883,6 +901,7 @@ class EvaTTT(nn.Module):
             ref_feat_shape: Optional[Union[Tuple[int, int], int]] = None,
             head_init_scale: float = 0.001,
             inner_net: str = 'linear_attention',
+            ttt_base_lr: float = 1.0,
     ):
         """
 
@@ -984,6 +1003,7 @@ class EvaTTT(nn.Module):
                 norm_layer=norm_layer,
                 init_values=init_values,
                 inner_net=inner_net,
+                ttt_base_lr=ttt_base_lr,
             )
             for i in range(depth)])
         self.feature_info = [

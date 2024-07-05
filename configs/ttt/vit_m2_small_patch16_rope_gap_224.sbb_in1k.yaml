@@ -1,6 +1,6 @@
 aa: rand-m6-inc1-mstd1.0-n3
 amp: true
-amp_dtype: float16
+amp_dtype: bfloat16
 amp_impl: native
 # aug_repeats: 3.0
 aug_repeats: 0.0
@@ -95,6 +95,7 @@ model_ema_force_cpu: false
 model_ema_warmup: true
 model_kwargs:
   img_size: 224
+  scale_attn_inner: true
 momentum: 0.9
 no_aug: false
 no_ddp_bb: false

@@ -628,6 +628,7 @@ def main():
             loss_scaler = NativeScaler()
         if utils.is_primary(args):
             _logger.info('Using native Torch AMP. Training in mixed precision.')
+            _logger.info(f'amp_dtype={amp_dtype}')
     else:
         if utils.is_primary(args):
             _logger.info('AMP not enabled. Training in float32.')

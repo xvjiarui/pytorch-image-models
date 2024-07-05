@@ -544,6 +544,7 @@ def main():
         model.set_grad_checkpointing(enable=True)
 
     if utils.is_primary(args):
+        _logger.info(str(model))
         _logger.info(
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
 

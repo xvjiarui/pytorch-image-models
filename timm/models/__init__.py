@@ -20,6 +20,7 @@ from .efficientnet import *
 from .efficientvit_mit import *
 from .efficientvit_msra import *
 from .eva import *
+from .eva_ttt import *
 from .fastvit import *
 from .focalnet import *
 from .gcvit import *

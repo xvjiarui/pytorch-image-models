@@ -1010,6 +1010,8 @@ def main():
             should_preempt = (
                 AutoResume is not None and AutoResume.termination_requested()
             )
+            # sync should_preempt from master to all ranks
+            should_preempt = utils.broadcast_object(args, should_preempt)
 
             if should_preempt:
                 if utils.is_primary(args):

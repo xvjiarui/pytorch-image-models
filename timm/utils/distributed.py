@@ -177,3 +177,12 @@ def init_distributed_device_so(
         world_size=world_size,
         distributed=distributed,
     )
+
+def broadcast_object(args, obj, src=0):
+    # broadcast a pickle-able python object from rank-0 to all ranks
+    if args.rank == src:
+        objects = [obj]
+    else:
+        objects = [None]
+    dist.broadcast_object_list(objects, src=src)
+    return objects[0]

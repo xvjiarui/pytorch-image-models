@@ -1362,3 +1362,69 @@ def vit_m2_small_patch16_rope_gap_224(pretrained=False, **kwargs) -> EvaTTT:
     )
     model = _create_eva_ttt('vit_m2_small_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
+
+
+@register_model
+def vit_la_base_patch16_rope_gap_224(pretrained=False, **kwargs) -> EvaTTT:
+    model_args = dict(
+        img_size=224,
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        qkv_fused=True,
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=False,
+        num_reg_tokens=0,
+        use_rot_pos_emb=True,
+        use_abs_pos_emb=False,
+        ref_feat_shape=(16, 16),  # 224/14
+        inner_net='linear_attention',
+    )
+    model = _create_eva_ttt('vit_la_base_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_m1_base_patch16_rope_gap_224(pretrained=False, **kwargs) -> EvaTTT:
+    model_args = dict(
+        img_size=224,
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        qkv_fused=True,
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=False,
+        num_reg_tokens=0,
+        use_rot_pos_emb=True,
+        use_abs_pos_emb=False,
+        ref_feat_shape=(16, 16),  # 224/14
+        inner_net='m1_primal',
+    )
+    model = _create_eva_ttt('vit_m1_base_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_m2_base_patch16_rope_gap_224(pretrained=False, **kwargs) -> EvaTTT:
+    model_args = dict(
+        img_size=224,
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        qkv_fused=True,
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=False,
+        num_reg_tokens=0,
+        use_rot_pos_emb=True,
+        use_abs_pos_emb=False,
+        ref_feat_shape=(16, 16),  # 224/14
+        inner_net='m2_primal',
+    )
+    model = _create_eva_ttt('vit_m2_base_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model

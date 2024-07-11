@@ -24,6 +24,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime, timedelta
 from functools import partial
+import re
 
 import torch
 import torch.nn as nn
@@ -870,7 +871,7 @@ def main():
                 wandb_exp_name = f"{exp_name}-{args.tag}"
             else:
                 wandb_exp_name = exp_name
-            wandb_run = wandb.init(project='timm', name=wandb_exp_name, tags=[args.tag] if args.tag else None, config=args, resume=args.resume != '', dir=output_dir)
+            wandb_run = wandb.init(project='timm', name=wandb_exp_name, tags=re.split("[-_]", args.tag) if args.tag else None, config=args, resume=args.resume != '', dir=output_dir)
             # manually write "wandb-resume.json" file
             # it is automatically created by wandb.init() only resume=True
             # so we manually create it when resume=False

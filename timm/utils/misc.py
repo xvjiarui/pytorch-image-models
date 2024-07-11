@@ -22,7 +22,7 @@ def add_bool_arg(parser, name, default=False, help=''):
 
 class ParseKwargs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
-        kw = {}
+        kw = self.default
         for value in values:
             key, value = value.split('=')
             try:

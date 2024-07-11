@@ -178,6 +178,8 @@ class TTTWrapper(nn.Module):
         attn_head_dim: Optional[int] = None,
         norm_layer: Optional[Callable] = None,
         ttt_base_lr: float = 1.0,
+        inner_rope: bool = False,
+        norm_after_qkv: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -231,9 +233,16 @@ class TTTWrapper(nn.Module):
     
         
         self.inner_model = inner_model
+        if norm_after_qkv:
+            self.q_norm = LayerNormFp32(head_dim)
+            self.k_norm = LayerNormFp32(head_dim)
+            self.v_norm = LayerNormFp32(head_dim)
+        else:
+            self.q_norm = self.k_norm = self.v_norm = nn.Identity()
+        self.inner_rope = inner_rope
 
     def extra_repr(self) -> str:
-        return f"ttt_base_lr={self.ttt_base_lr}"
+        return f"ttt_base_lr={self.ttt_base_lr}, inner_rope={self.inner_rope}"
 
     def forward(
             self,
@@ -252,8 +261,12 @@ class TTTWrapper(nn.Module):
             q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
             k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
 
-        if rope is not None:
+        if rope is not None and not self.inner_rope:
             npt = self.num_prefix_tokens
             q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
             k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
@@ -269,7 +282,10 @@ class TTTWrapper(nn.Module):
             inner_meta = InnerMeta(self.inner_model, B)
             self_params = inner_meta.to_self_parms()
 
-            train_pred = self.inner_model(k, self_params)
+            if self.inner_rope:
+                train_pred = self.inner_model(k, self_params, rope=rope)
+            else:
+                train_pred = self.inner_model(k, self_params)
             train_pred = ln_fwd(train_pred, ttt_norm_weight, ttt_norm_bias)
             mse_loss = 0.5 * (train_pred - reconstruction_target) ** 2
             mse_loss = mse_loss * ttt_lr_eta
@@ -345,12 +361,13 @@ class InnerLinear(nn.Module):
 
 class InnerAttention(nn.Module):
     
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, num_prefix_tokens: int):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.head_dim = head_dim
         self.scale = self.head_dim ** -0.5
+        self.num_prefix_tokens = num_prefix_tokens
 
         # inner loop weight matrix initialization for TTT-Linear
         self.wqkv = nn.Parameter(torch.normal(0, 0.02, size=(self.num_heads, self.head_dim, self.head_dim * 3)))
@@ -358,7 +375,7 @@ class InnerAttention(nn.Module):
         self.bqkv = nn.Parameter(torch.zeros(self.num_heads, 1, self.head_dim *3))
 
 
-    def forward(self, x, self_params=None):
+    def forward(self, x, self_params, rope=None):
         """
         Args:
             x (torch.Tensor): [B, num_heads, N, head_dim]
@@ -369,6 +386,12 @@ class InnerAttention(nn.Module):
         qkv = (x @ self_params.wqkv) + self_params.bqkv
         qkv = qkv.reshape(B, num_heads, N, head_dim, 3)
         q, k, v = qkv.unbind(-1)
+
+        if rope is not None:
+            npt = self.num_prefix_tokens
+            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+
         # x = F.scaled_dot_product_attention(q, k, v)
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
@@ -867,6 +890,8 @@ class EvaBlock(nn.Module):
             attn_head_dim: Optional[int] = None,
             inner_net: str = 'linear_attention',
             ttt_base_lr: float = 1.0,
+            inner_rope: bool = False,
+            norm_after_qkv: bool = False,
     ):
         """
 
@@ -944,7 +969,7 @@ class EvaBlock(nn.Module):
         elif inner_net == 'attn_wrapper':
             self.attn = TTTWrapper(
                 dim,
-                inner_model=InnerAttention(dim, num_heads),
+                inner_model=InnerAttention(dim, num_heads, num_prefix_tokens=num_prefix_tokens),
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
                 qkv_fused=qkv_fused,
@@ -954,6 +979,8 @@ class EvaBlock(nn.Module):
                 attn_head_dim=attn_head_dim,
                 norm_layer=norm_layer if scale_attn_inner else None,
                 ttt_base_lr=ttt_base_lr,
+                inner_rope=inner_rope,
+                norm_after_qkv=norm_after_qkv,
             )
         else:
             raise ValueError(f"Unsupported inner_net: {inner_net}")
@@ -1100,7 +1127,7 @@ class EvaBlockPostNorm(nn.Module):
         elif inner_net == 'attn_wrapper':
             self.attn = TTTWrapper(
                 dim,
-                inner_model=InnerAttention(dim, num_heads),
+                inner_model=InnerAttention(dim, num_heads, num_prefix_tokens=num_prefix_tokens),
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
                 qkv_fused=qkv_fused,
@@ -1196,6 +1223,8 @@ class EvaTTT(nn.Module):
             head_init_scale: float = 0.001,
             inner_net: str = 'linear_attention',
             ttt_base_lr: float = 1.0,
+            inner_rope: bool = False,
+            norm_after_qkv: bool = False,
     ):
         """
 
@@ -1298,6 +1327,8 @@ class EvaTTT(nn.Module):
                 init_values=init_values,
                 inner_net=inner_net,
                 ttt_base_lr=ttt_base_lr,
+                inner_rope=inner_rope,
+                norm_after_qkv=norm_after_qkv,
             )
             for i in range(depth)])
         self.feature_info = [

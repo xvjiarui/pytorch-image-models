@@ -232,6 +232,9 @@ class TTTWrapper(nn.Module):
         
         self.inner_model = inner_model
 
+    def extra_repr(self) -> str:
+        return f"ttt_base_lr={self.ttt_base_lr}"
+
     def forward(
             self,
             x,
@@ -1020,6 +1023,7 @@ class EvaBlockPostNorm(nn.Module):
             norm_layer: Callable = nn.LayerNorm,
             attn_head_dim: Optional[int] = None,
             inner_net: str = 'linear_attention',
+            ttt_base_lr: float = 1.0,
     ):
         """
 
@@ -1064,6 +1068,7 @@ class EvaBlockPostNorm(nn.Module):
                 proj_drop=proj_drop,
                 attn_head_dim=attn_head_dim,
                 norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
             )
         elif inner_net == 'm2_primal':
             self.attn = EvaM2Primal(
@@ -1076,6 +1081,35 @@ class EvaBlockPostNorm(nn.Module):
                 proj_drop=proj_drop,
                 attn_head_dim=attn_head_dim,
                 norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
+            )
+        elif inner_net == 'm1_wrapper':
+            self.attn = TTTWrapper(
+                dim,
+                inner_model=InnerLinear(dim, num_heads),
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                qkv_fused=qkv_fused,
+                num_prefix_tokens=num_prefix_tokens,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                attn_head_dim=attn_head_dim,
+                norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
+            )
+        elif inner_net == 'attn_wrapper':
+            self.attn = TTTWrapper(
+                dim,
+                inner_model=InnerAttention(dim, num_heads),
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                qkv_fused=qkv_fused,
+                num_prefix_tokens=num_prefix_tokens,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                attn_head_dim=attn_head_dim,
+                norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
             )
         else:
             raise ValueError(f"Unsupported inner_net: {inner_net}")

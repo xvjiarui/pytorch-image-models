@@ -26,6 +26,7 @@ Modifications by / Copyright 2023 Ross Wightman, original copyrights below
 # EVA02 models Copyright (c) 2023 BAAI-Vision
 import math
 from typing import Callable, List, Optional, Tuple, Union
+import logging
 
 import torch
 import torch.nn as nn
@@ -298,7 +299,10 @@ class TTTWrapper(nn.Module):
         for (name, _), param in zip(self.inner_model.named_parameters(), updated_inner_params):
             self_params[name] = param
 
-        test_pred = self.inner_model(q, self_params)
+        if self.inner_rope:
+            test_pred = self.inner_model(q, self_params, rope=rope)
+        else:
+            test_pred = self.inner_model(q, self_params)
         test_pred = ln_fwd(test_pred, ttt_norm_weight, ttt_norm_bias)
         x = test_pred + q
 
@@ -380,10 +384,22 @@ class InnerAttention(nn.Module):
         Args:
             x (torch.Tensor): [B, num_heads, N, head_dim]
         """
-        B, num_heads, N, head_dim = x.shape
+        if isinstance(x, tuple):
+            q, k, v = x
+            # [3, B, num_heads, N, head_dim]
+            qkv = torch.stack([q, k, v], dim=0)
+            B, num_heads, N, head_dim = qkv.shape[1:]
+            wqkv = self_params.wqkv.reshape(B, num_heads, head_dim, head_dim, 3).permute(4, 0, 1, 2, 3)
+            bqkv = self_params.bqkv.reshape(B, num_heads, 1, head_dim, 3).permute(4, 0, 1, 2, 3)
+            # [3, B, nh, N, f] @ [3, B, nh, f, f]
+            qkv = (qkv @ wqkv) + bqkv
+            q, k, v = qkv.unbind(0)
+        else:
+            q = k = v = x
+            B, num_heads, N, head_dim = x.shape
 
-        # [B, nh, K, f] @ [B, nh, f, 3f]
-        qkv = (x @ self_params.wqkv) + self_params.bqkv
+            # [B, nh, N, f] @ [B, nh, f, 3f]
+            qkv = (x @ self_params.wqkv) + self_params.bqkv
         qkv = qkv.reshape(B, num_heads, N, head_dim, 3)
         q, k, v = qkv.unbind(-1)
 
@@ -399,6 +415,181 @@ class InnerAttention(nn.Module):
         x = attn @ v
 
         return x
+
+class TTTMaeWrapper(nn.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        inner_model: nn.Module,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        qkv_fused: bool = True,
+        num_prefix_tokens: int = 1,
+        attn_drop: float = 0.,
+        proj_drop: float = 0.,
+        attn_head_dim: Optional[int] = None,
+        norm_layer: Optional[Callable] = None,
+        ttt_base_lr: float = 1.0,
+        inner_rope: bool = False,
+        norm_after_qkv: bool = False,
+        mask_ratio: float = 0.3,
+        layer_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.head_dim = head_dim
+        if attn_head_dim is not None:
+            head_dim = attn_head_dim
+        all_head_dim = head_dim * self.num_heads
+        self.num_prefix_tokens = num_prefix_tokens
+
+        if qkv_fused:
+            self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
+            self.q_proj = self.k_proj = self.v_proj = None
+            if qkv_bias:
+                self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
+                self.register_buffer('k_bias', torch.zeros(all_head_dim), persistent=False)
+                self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
+            else:
+                self.q_bias = self.k_bias = self.v_bias = None
+        else:
+            self.q_proj = nn.Linear(dim, all_head_dim, bias=qkv_bias)
+            self.k_proj = nn.Linear(dim, all_head_dim, bias=False)
+            self.v_proj = nn.Linear(dim, all_head_dim, bias=qkv_bias)
+            self.qkv = None
+            self.q_bias = self.k_bias = self.v_bias = None
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.norm = norm_layer(all_head_dim) if norm_layer is not None else nn.Identity()
+        self.proj = nn.Linear(all_head_dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.ttt_base_lr = ttt_base_lr
+        # [width, 1]
+        linear_weight_data = nn.Linear(dim, 1, bias=True).weight.data
+        # prepending head dim -> [num_heads, width, 1]
+        self.learnable_ttt_lr_weight = nn.Parameter(
+            torch.stack([torch.normal(0, 0.02, size=linear_weight_data.shape) for _ in range(num_heads)], dim=0)
+        )
+        linear_bias_data = nn.Linear(dim, 1, bias=True).bias.data
+        # init bias to 0 following original JAX impl.
+        # [num_heads, 1]
+        self.learnable_ttt_lr_bias = nn.Parameter(
+            torch.stack([torch.zeros_like(linear_bias_data) for _ in range(num_heads)], dim=0)
+        )
+
+        ln_weight_data = nn.LayerNorm(head_dim).weight.data
+        # prepending head dim -> [num_heads, width]
+        self.ttt_norm_weight = nn.Parameter(torch.tile(ln_weight_data.unsqueeze(0), (num_heads, 1)))
+        ln_bias_data = nn.LayerNorm(head_dim).bias.data
+        self.ttt_norm_bias = nn.Parameter(torch.tile(ln_bias_data.unsqueeze(0), (num_heads, 1)))
+    
+        
+        self.inner_model = inner_model
+        if norm_after_qkv:
+            self.q_norm = LayerNormFp32(head_dim)
+            self.k_norm = LayerNormFp32(head_dim)
+            self.v_norm = LayerNormFp32(head_dim)
+        else:
+            self.q_norm = self.k_norm = self.v_norm = nn.Identity()
+        self.inner_rope = inner_rope
+        self.qkv_mask_token = nn.Parameter(torch.normal(0, 0.02, size=(1, num_heads, 1, head_dim, 3)))
+
+        assert mask_ratio > 0
+        self.mask_ratio = mask_ratio
+        assert layer_idx is not None, "layer_idx must be provided for masking"
+        self.layer_idx = layer_idx
+        self.rng = None
+
+    def extra_repr(self) -> str:
+        return f"ttt_base_lr={self.ttt_base_lr}, inner_rope={self.inner_rope}, mask_ratio={self.mask_ratio}, layer_idx={self.layer_idx}"
+
+    def forward(
+            self,
+            x,
+            rope: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):
+        B, N, C = x.shape
+
+        if self.qkv is not None:
+            qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias)) if self.q_bias is not None else None
+            qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+            qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)  # B, num_heads, N, head_dim
+        else:
+            q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
+            k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+            v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
+
+        if rope is not None and not self.inner_rope:
+            npt = self.num_prefix_tokens
+            q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+            k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+        
+        ttt_norm_weight = self.ttt_norm_weight.reshape(self.num_heads, 1, -1)
+        ttt_norm_bias = self.ttt_norm_bias.reshape(self.num_heads, 1, -1)
+
+        # [B, num_heads, N, 1]
+        ttt_lr_eta = self.get_eta(x) / q.shape[-1]
+
+        # [B, num_heads, N, head_dim]
+        q_mask_token, k_mask_token, v_mask_token = self.qkv_mask_token.expand(B, -1, N, -1, -1).unbind(-1)
+        if self.rng is None:
+            # make a generator for masking with layer_idx
+            self.rng = torch.Generator(x.device).manual_seed(self.layer_idx)
+        # rand_mask = torch.rand(B, 1, N, 1, device=x.device, generator=self.rng) < self.mask_ratio
+        rand_mask = torch.rand(B, self.num_heads, N, 1, device=x.device, generator=self.rng) < self.mask_ratio
+        q_masked = torch.where(rand_mask, q_mask_token, q)
+        k_masked = torch.where(rand_mask, k_mask_token, k)
+        v_masked = torch.where(rand_mask, v_mask_token, v)
+
+        with torch.enable_grad():
+            inner_meta = InnerMeta(self.inner_model, B)
+            self_params = inner_meta.to_self_parms()
+
+            train_pred = self.inner_model((q_masked, k_masked, v_masked), self_params, rope=rope if self.inner_rope else None)
+            train_pred = ln_fwd(train_pred, ttt_norm_weight, ttt_norm_bias)
+            mse_loss = 0.5 * (train_pred - v) ** 2
+            mse_loss = mse_loss * rand_mask
+            mse_loss = mse_loss * ttt_lr_eta
+            mse_loss = mse_loss.sum() / N
+            gradients = torch.autograd.grad(
+                mse_loss, inner_meta.params, create_graph=True
+            )
+            optim = OnlineSGD(inner_meta.params, lr=self.ttt_base_lr)
+            updated_inner_params = optim.step_online(gradients)
+        for (name, _), param in zip(self.inner_model.named_parameters(), updated_inner_params):
+            self_params[name] = param
+
+        test_pred = self.inner_model((q, k, v), self_params, rope=rope if self.inner_rope else None)
+        test_pred = ln_fwd(test_pred, ttt_norm_weight, ttt_norm_bias)
+        x = test_pred
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.norm(x)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def get_eta(self, x):
+        B, N, C = x.shape
+
+        # [B, num_heads, N, 1]
+        ttt_lr = torch.einsum("bnc,hdc->bhnd", x, self.learnable_ttt_lr_weight) + self.learnable_ttt_lr_bias.reshape(
+            1, -1, 1, 1
+        )
+        ttt_lr = F.sigmoid(ttt_lr)
+
+        ttt_lr = self.ttt_base_lr * ttt_lr
+
+        return ttt_lr
         
 
 class EvaBasePrimal(nn.Module):
@@ -892,6 +1083,8 @@ class EvaBlock(nn.Module):
             ttt_base_lr: float = 1.0,
             inner_rope: bool = False,
             norm_after_qkv: bool = False,
+            layer_idx: Optional[int] = None,
+            mask_ratio: float = 0.3,
     ):
         """
 
@@ -982,6 +1175,24 @@ class EvaBlock(nn.Module):
                 inner_rope=inner_rope,
                 norm_after_qkv=norm_after_qkv,
             )
+        elif inner_net == 'attn_mae_wrapper':
+            self.attn = TTTMaeWrapper(
+                dim,
+                inner_model=InnerAttention(dim, num_heads, num_prefix_tokens=num_prefix_tokens),
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                qkv_fused=qkv_fused,
+                num_prefix_tokens=num_prefix_tokens,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                attn_head_dim=attn_head_dim,
+                norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
+                inner_rope=inner_rope,
+                norm_after_qkv=norm_after_qkv,
+                layer_idx=layer_idx,
+                mask_ratio=mask_ratio,
+            )
         else:
             raise ValueError(f"Unsupported inner_net: {inner_net}")
         self.gamma_1 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
@@ -1051,6 +1262,10 @@ class EvaBlockPostNorm(nn.Module):
             attn_head_dim: Optional[int] = None,
             inner_net: str = 'linear_attention',
             ttt_base_lr: float = 1.0,
+            inner_rope: bool = False,
+            norm_after_qkv: bool = False,
+            layer_idx: Optional[int] = None,
+            mask_ratio: float = 0.3,
     ):
         """
 
@@ -1137,6 +1352,26 @@ class EvaBlockPostNorm(nn.Module):
                 attn_head_dim=attn_head_dim,
                 norm_layer=norm_layer if scale_attn_inner else None,
                 ttt_base_lr=ttt_base_lr,
+                inner_rope=inner_rope,
+                norm_after_qkv=norm_after_qkv,
+            )
+        elif inner_net == 'attn_mae_wrapper':
+            self.attn = TTTMaeWrapper(
+                dim,
+                inner_model=InnerAttention(dim, num_heads, num_prefix_tokens=num_prefix_tokens),
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                qkv_fused=qkv_fused,
+                num_prefix_tokens=num_prefix_tokens,
+                attn_drop=attn_drop,
+                proj_drop=proj_drop,
+                attn_head_dim=attn_head_dim,
+                norm_layer=norm_layer if scale_attn_inner else None,
+                ttt_base_lr=ttt_base_lr,
+                inner_rope=inner_rope,
+                norm_after_qkv=norm_after_qkv,
+                layer_idx=layer_idx,
+                mask_ratio=mask_ratio,
             )
         else:
             raise ValueError(f"Unsupported inner_net: {inner_net}")
@@ -1225,6 +1460,7 @@ class EvaTTT(nn.Module):
             ttt_base_lr: float = 1.0,
             inner_rope: bool = False,
             norm_after_qkv: bool = False,
+            mask_ratio: float = 0.3,
     ):
         """
 
@@ -1329,6 +1565,8 @@ class EvaTTT(nn.Module):
                 ttt_base_lr=ttt_base_lr,
                 inner_rope=inner_rope,
                 norm_after_qkv=norm_after_qkv,
+                layer_idx=i,
+                mask_ratio=mask_ratio,
             )
             for i in range(depth)])
         self.feature_info = [
@@ -1794,4 +2032,25 @@ def vit_ttt_attn_base_patch16_rope_gap_224(pretrained=False, **kwargs) -> EvaTTT
         inner_net='attn_wrapper',
     )
     model = _create_eva_ttt('vit_ttt_attn_base_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+@register_model
+def vit_ttt_mae_attn_base_patch16_rope_gap_224(pretrained=False, **kwargs) -> EvaTTT:
+    model_args = dict(
+        img_size=224,
+        patch_size=16,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        qkv_fused=True,
+        qkv_bias=True,
+        init_values=1e-5,
+        class_token=False,
+        num_reg_tokens=0,
+        use_rot_pos_emb=True,
+        use_abs_pos_emb=False,
+        ref_feat_shape=(16, 16),  # 224/14
+        inner_net='attn_mae_wrapper',
+    )
+    model = _create_eva_ttt('vit_ttt_mae_attn_base_patch16_rope_gap_224', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
